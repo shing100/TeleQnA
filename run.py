@@ -3,8 +3,35 @@ import os
 import json
 import numpy as np
 import pandas as pd
+import sys
 
-model = "gpt-3.5-turbo"
+# 명령행 인자 또는 환경 변수로 모델 지정 가능
+specified_model = None
+if len(sys.argv) > 1:
+    specified_model = sys.argv[1]
+    print(f"Model specified via command line: {specified_model}")
+elif "VLLM_MODEL" in os.environ:
+    specified_model = os.environ["VLLM_MODEL"]
+    print(f"Model specified via environment variable: {specified_model}")
+
+if specified_model:
+    model = specified_model
+    print(f"Using specified model: {model}")
+else:
+    # 자동으로 사용 가능한 모델 가져오기
+    print("Getting available models from vLLM server...")
+    available_models = get_available_models()
+
+    if available_models:
+        model = select_model(available_models)
+        if model is None:
+            print("Error: No suitable model found")
+            exit(1)
+    else:
+        print("Error: Could not retrieve models from vLLM server")
+        print("Please check if vLLM server is running at the configured endpoint")
+        print("Usage: python run.py [model_name] or set VLLM_MODEL environment variable")
+        exit(1)
 questions_path = "TeleQnA.txt"
 save_path = os.path.join(model+"_answers.txt")
 
