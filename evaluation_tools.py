@@ -2,6 +2,9 @@ from copy import deepcopy
 import json
 import requests
 import ast
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
 
 # vLLM API 설정 - 환경 변수로 오버라이드 가능
 import os
@@ -156,3 +159,68 @@ def check_questions_with_val_output(questions_dict, model):
                 accepted_questions[q] = questions_dict[q]
 
     return accepted_questions, parsed_predicted_answers
+
+def process_single_question_batch(question_batch_data):
+    """단일 배치를 처리하는 함수 (멀티프로세스용)"""
+    batch_id, questions_dict, model, max_attempts = question_batch_data
+    
+    for attempt in range(max_attempts):
+        try:
+            accepted_questions, parsed_predicted_answers = check_questions_with_val_output(questions_dict, model)
+            
+            # 결과 정리
+            results = {}
+            for q in questions_dict:
+                results[q] = deepcopy(questions_dict[q])
+                results[q]['tested answer'] = parsed_predicted_answers[q]['answer'] if q in parsed_predicted_answers else "Error: No answer"
+                results[q]['correct'] = q in accepted_questions
+                
+            return batch_id, results, True  # 성공
+            
+        except Exception as e:
+            print(f"Batch {batch_id} attempt {attempt + 1} failed: {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(1)  # 재시도 전 잠시 대기
+            
+    return batch_id, {}, False  # 실패
+
+def check_questions_parallel(all_questions, model, n_questions=5, max_attempts=5, n_processes=None):
+    """멀티프로세스로 질문들을 병렬 처리"""
+    if n_processes is None:
+        n_processes = min(cpu_count(), 4)  # CPU 코어 수와 4 중 작은 값 사용
+    
+    print(f"Using {n_processes} processes for parallel evaluation")
+    
+    # 배치 생성
+    batches = []
+    shuffled_idx = list(range(len(all_questions)))
+    
+    for start_id in range(0, len(all_questions), n_questions):
+        end_id = min(start_id + n_questions, len(all_questions))
+        
+        batch_questions = {}
+        for k in range(start_id, end_id):
+            q_name = f"question {shuffled_idx[k]}"
+            if q_name in all_questions:
+                batch_questions[q_name] = all_questions[q_name]
+        
+        if batch_questions:  # 빈 배치가 아닌 경우만 추가
+            batch_id = start_id // n_questions
+            batches.append((batch_id, batch_questions, model, max_attempts))
+    
+    # 멀티프로세스 실행
+    all_results = {}
+    successful_batches = 0
+    
+    with Pool(processes=n_processes) as pool:
+        batch_results = pool.map(process_single_question_batch, batches)
+        
+        for batch_id, results, success in batch_results:
+            if success:
+                all_results.update(results)
+                successful_batches += 1
+            else:
+                print(f"Batch {batch_id} failed after all attempts")
+    
+    print(f"Completed {successful_batches}/{len(batches)} batches successfully")
+    return all_results
