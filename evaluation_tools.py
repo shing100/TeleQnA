@@ -2,6 +2,7 @@ from copy import deepcopy
 import json
 import requests
 import ast
+import re
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import time
@@ -139,10 +140,64 @@ def check_questions_with_val_output(questions_dict, model):
     predicted_answers_str = generated_output["choices"][0]["message"]["content"]
 
     
+    # ```json 코드 블록이 있는 경우 처리
+    if "```json" in predicted_answers_str:
+        # ```json과 ``` 사이의 내용 추출
+        start_marker = "```json"
+        end_marker = "```"
+        start_idx = predicted_answers_str.find(start_marker) + len(start_marker)
+        end_idx = predicted_answers_str.find(end_marker, start_idx)
+        if end_idx != -1:
+            predicted_answers_str = predicted_answers_str[start_idx:end_idx].strip()
+    elif "```" in predicted_answers_str:
+        # 일반 코드 블록 처리 (```로 시작하는 경우)
+        lines = predicted_answers_str.split('\n')
+        in_code_block = False
+        json_lines = []
+        for line in lines:
+            if line.strip().startswith('```') and not in_code_block:
+                in_code_block = True
+                continue
+            elif line.strip() == '```' and in_code_block:
+                break
+            elif in_code_block:
+                json_lines.append(line)
+        if json_lines:
+            predicted_answers_str = '\n'.join(json_lines)
+    
+    # JSON 정리 및 파싱 시도
     predicted_answers_str = predicted_answers_str.replace('"\n', '",\n')
     predicted_answers_str = predicted_answers_str[predicted_answers_str.find("{"):]
     
-    parsed_predicted_answers = ast.literal_eval(predicted_answers_str)
+    # 여러 방법으로 JSON 파싱 시도
+    parsed_predicted_answers = None
+    
+    # 방법 1: ast.literal_eval 시도
+    try:
+        parsed_predicted_answers = ast.literal_eval(predicted_answers_str)
+    except (ValueError, SyntaxError):
+        pass
+    
+    # 방법 2: json.loads 시도
+    if parsed_predicted_answers is None:
+        try:
+            parsed_predicted_answers = json.loads(predicted_answers_str)
+        except json.JSONDecodeError:
+            pass
+    
+    # 방법 3: 더 관대한 JSON 정리 후 재시도
+    if parsed_predicted_answers is None:
+        try:
+            # 불완전한 JSON 정리
+            cleaned_str = re.sub(r',\s*}', '}', predicted_answers_str)  # 마지막 쉼표 제거
+            cleaned_str = re.sub(r',\s*]', ']', cleaned_str)  # 배열 마지막 쉼표 제거
+            parsed_predicted_answers = json.loads(cleaned_str)
+        except json.JSONDecodeError:
+            pass
+    
+    # 파싱 실패 시 예외 발생
+    if parsed_predicted_answers is None:
+        raise Exception(f"Failed to parse JSON response: {predicted_answers_str[:500]}...")
     
     for q in parsed_predicted_answers:
         if "answer" in parsed_predicted_answers[q] and "question" in parsed_predicted_answers[q]:
