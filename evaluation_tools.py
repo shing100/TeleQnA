@@ -140,71 +140,134 @@ def check_questions_with_val_output(questions_dict, model):
     predicted_answers_str = generated_output["choices"][0]["message"]["content"]
 
     
-    # ```json 코드 블록이 있는 경우 처리
-    if "```json" in predicted_answers_str:
-        # ```json과 ``` 사이의 내용 추출
-        start_marker = "```json"
-        end_marker = "```"
-        start_idx = predicted_answers_str.find(start_marker) + len(start_marker)
-        end_idx = predicted_answers_str.find(end_marker, start_idx)
-        if end_idx != -1:
-            predicted_answers_str = predicted_answers_str[start_idx:end_idx].strip()
-    elif "```" in predicted_answers_str:
-        # 일반 코드 블록 처리 (```로 시작하는 경우)
-        lines = predicted_answers_str.split('\n')
-        in_code_block = False
-        json_lines = []
-        for line in lines:
-            if line.strip().startswith('```') and not in_code_block:
-                in_code_block = True
-                continue
-            elif line.strip() == '```' and in_code_block:
-                break
-            elif in_code_block:
-                json_lines.append(line)
-        if json_lines:
-            predicted_answers_str = '\n'.join(json_lines)
+    # 코드 블록 처리 개선
+    def extract_json_from_codeblock(text):
+        """다양한 형태의 코드 블록에서 JSON 추출"""
+        # 여러 마커 패턴 시도
+        patterns = [
+            r'```json\s*(.*?)\s*```',
+            r'```JSON\s*(.*?)\s*```', 
+            r'```\s*\{(.*?)\}\s*```',
+            r'```\s*(.*?)\s*```'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+            if matches:
+                json_content = matches[0].strip()
+                if json_content.startswith('{'):
+                    return json_content
+                # 중괄호가 없으면 추가
+                elif '{' in json_content and '}' in json_content:
+                    start_brace = json_content.find('{')
+                    return json_content[start_brace:]
+        
+        return text
+    
+    if "```" in predicted_answers_str:
+        predicted_answers_str = extract_json_from_codeblock(predicted_answers_str)
     
     # JSON 정리 및 파싱 시도
     predicted_answers_str = predicted_answers_str.replace('"\n', '",\n')
     predicted_answers_str = predicted_answers_str[predicted_answers_str.find("{"):]
     
-    # 여러 방법으로 JSON 파싱 시도
-    parsed_predicted_answers = None
-    
-    # 방법 1: ast.literal_eval 시도
-    try:
-        parsed_predicted_answers = ast.literal_eval(predicted_answers_str)
-    except (ValueError, SyntaxError):
-        pass
-    
-    # 방법 2: json.loads 시도
-    if parsed_predicted_answers is None:
+    # 강화된 JSON 파싱 함수
+    def robust_json_parse(json_str):
+        """다양한 방법으로 JSON 파싱 시도"""
+        parsing_attempts = []
+        
+        # 방법 1: 기본 json.loads
         try:
-            parsed_predicted_answers = json.loads(predicted_answers_str)
-        except json.JSONDecodeError:
-            pass
-    
-    # 방법 3: 더 관대한 JSON 정리 후 재시도
-    if parsed_predicted_answers is None:
+            result = json.loads(json_str)
+            parsing_attempts.append(("json.loads", "success"))
+            return result, parsing_attempts
+        except json.JSONDecodeError as e:
+            parsing_attempts.append(("json.loads", f"failed: {str(e)[:100]}"))
+        
+        # 방법 2: ast.literal_eval
         try:
-            # 불완전한 JSON 정리
-            cleaned_str = re.sub(r',\s*}', '}', predicted_answers_str)  # 마지막 쉼표 제거
-            cleaned_str = re.sub(r',\s*]', ']', cleaned_str)  # 배열 마지막 쉼표 제거
-            parsed_predicted_answers = json.loads(cleaned_str)
-        except json.JSONDecodeError:
-            pass
+            result = ast.literal_eval(json_str)
+            parsing_attempts.append(("ast.literal_eval", "success"))
+            return result, parsing_attempts
+        except (ValueError, SyntaxError) as e:
+            parsing_attempts.append(("ast.literal_eval", f"failed: {str(e)[:100]}"))
+        
+        # 방법 3: JSON 정리 후 재시도
+        try:
+            # 여러 정리 작업 수행
+            cleaned_str = json_str.strip()
+            # 마지막 쉼표 제거
+            cleaned_str = re.sub(r',\s*}', '}', cleaned_str)
+            cleaned_str = re.sub(r',\s*]', ']', cleaned_str)
+            # 누락된 따옴표 수정 시도
+            cleaned_str = re.sub(r'(\w+):', r'"\1":', cleaned_str)
+            # 잘못된 따옴표 수정
+            cleaned_str = cleaned_str.replace("'", '"')
+            
+            result = json.loads(cleaned_str)
+            parsing_attempts.append(("cleaned_json", "success"))
+            return result, parsing_attempts
+        except json.JSONDecodeError as e:
+            parsing_attempts.append(("cleaned_json", f"failed: {str(e)[:100]}"))
+        
+        # 방법 4: 정규식을 이용한 강제 파싱
+        try:
+            # question 패턴 추출
+            question_pattern = r'"question\s*(\d+)"\s*:\s*\{[^}]*"question"\s*:\s*"([^"]+)"\s*,\s*"answer"\s*:\s*"([^"]+)"\s*\}'
+            matches = re.findall(question_pattern, json_str, re.IGNORECASE | re.DOTALL)
+            
+            if matches:
+                result = {}
+                for q_num, question, answer in matches:
+                    key = f"question {q_num}"
+                    result[key] = {
+                        "question": question.strip(),
+                        "answer": answer.strip()
+                    }
+                parsing_attempts.append(("regex_parsing", f"success: extracted {len(matches)} questions"))
+                return result, parsing_attempts
+            else:
+                parsing_attempts.append(("regex_parsing", "failed: no matches found"))
+        except Exception as e:
+            parsing_attempts.append(("regex_parsing", f"failed: {str(e)[:100]}"))
+        
+        return None, parsing_attempts
     
-    # 파싱 실패 시 예외 발생
+    # 파싱 시도
+    parsed_predicted_answers, parsing_log = robust_json_parse(predicted_answers_str)
+    
+    # 파싱 실패 시 상세한 오류 정보 제공
     if parsed_predicted_answers is None:
-        raise Exception(f"Failed to parse JSON response: {predicted_answers_str[:500]}...")
+        error_details = "\n".join([f"  {method}: {result}" for method, result in parsing_log])
+        raise Exception(f"Failed to parse JSON response after multiple attempts:\n{error_details}\n\nOriginal response: {predicted_answers_str[:500]}...")
     
-    for q in parsed_predicted_answers:
-        if "answer" in parsed_predicted_answers[q] and "question" in parsed_predicted_answers[q]:
-            parsed_predicted_answers[q] = {
-                "question": parsed_predicted_answers[q]["question"],
-                "answer": parsed_predicted_answers[q]["answer"]
-            }
+    # 응답 형식 정규화 및 검증
+    def normalize_answer_format(answers_dict):
+        """응답 형식을 정규화하고 검증"""
+        normalized = {}
+        for q_key, q_data in answers_dict.items():
+            if isinstance(q_data, dict):
+                # 필수 필드 확인
+                if "question" in q_data and "answer" in q_data:
+                    normalized[q_key] = {
+                        "question": str(q_data["question"]).strip(),
+                        "answer": str(q_data["answer"]).strip()
+                    }
+                # question 필드가 없는 경우 추론 시도
+                elif "answer" in q_data:
+                    normalized[q_key] = {
+                        "question": "Unknown question",
+                        "answer": str(q_data["answer"]).strip()
+                    }
+            # 단순 문자열인 경우 answer로 처리
+            elif isinstance(q_data, str):
+                normalized[q_key] = {
+                    "question": "Unknown question", 
+                    "answer": q_data.strip()
+                }
+        return normalized
+    
+    parsed_predicted_answers = normalize_answer_format(parsed_predicted_answers)
     
     accepted_questions = {}
     
@@ -233,9 +296,17 @@ def process_single_question_batch(question_batch_data):
             return batch_id, results, True  # 성공
             
         except Exception as e:
-            print(f"Batch {batch_id} attempt {attempt + 1} failed: {e}")
+            error_msg = str(e)
+            print(f"Batch {batch_id} attempt {attempt + 1} failed: {error_msg}")
+            
+            # 파싱 오류인 경우 더 자세한 정보 출력
+            if "Failed to parse JSON response" in error_msg:
+                print(f"  Parsing error details for batch {batch_id}")
+                
             if attempt < max_attempts - 1:
-                time.sleep(1)  # 재시도 전 잠시 대기
+                wait_time = min(2 ** attempt, 10)  # 지수 백오프 (최대 10초)
+                print(f"  Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
             
     return batch_id, {}, False  # 실패
 
